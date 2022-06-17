@@ -7,9 +7,9 @@ from torch.utils.data import DataLoader
 
 from calibration import TemperatureScaling
 from metrics import ECELoss
-from net import Net
+from net import resnet18
 
-net = Net() 
+net = resnet18(True, num_classes=10) 
 
 # TODO convert net to ResNet50
 # TODO add ts val
@@ -26,14 +26,14 @@ val_size = 5000
 
 test_ds, val_ds = torch.utils.data.random_split(set, [len(set) - val_size, val_size])
 
-val_loader = torch.utils.data.DataLoader(val_ds, batch_size=50,
+val_loader = torch.utils.data.DataLoader(val_ds, batch_size=256,
                                         shuffle=True, num_workers=0)
-test_loader = torch.utils.data.DataLoader(test_ds, batch_size=50,
+test_loader = torch.utils.data.DataLoader(test_ds, batch_size=256,
                                           shuffle=True, num_workers=0)
 
 train_set = torchvision.datasets.CIFAR10(root='./data', train=False,
                                         download=True, transform=transform)
-train_loader = torch.utils.data.DataLoader(train_set, batch_size=50,
+train_loader = torch.utils.data.DataLoader(train_set, batch_size=256,
                                            shuffle=True, num_workers=0)                                        
 
 def test(model, loader):
@@ -54,9 +54,9 @@ def test(model, loader):
 import torch.optim as optim
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
+optimizer = optim.SGD(net.fc.parameters(), lr=0.001, momentum=0.9)
 
-for epoch in range(50):  # loop over the dataset multiple times
+for epoch in range(1):  # loop over the dataset multiple times
 
     running_loss = 0.0
     for i, data in enumerate(train_loader, 0):
@@ -78,8 +78,10 @@ for epoch in range(50):  # loop over the dataset multiple times
             print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
             running_loss = 0.0
 
-print('Finished Training')
+        break
 
+print('Finished Training')
+net.eval()
 print("#" * 100)
 print("Plain: Acc %.3f, ECE %.3f" % test(net, test_loader))
 
