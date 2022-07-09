@@ -7,6 +7,7 @@ from typing import OrderedDict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributions as dist
 import os
 
 class BasicBlock(nn.Module):
@@ -106,8 +107,133 @@ def resnet50(temp=1.0, download=False, **kwargs):
                              'resnet50_cross_entropy_350.model'),
                 progress=True,
                 map_location=torch.device('cpu'))
-        
         # remove module from keys
-        new_di = OrderedDict((keys.removeprefix("module."), v) for keys, v in di.items())
+        new_di = OrderedDict((keys[len("module."):], v) for keys, v in di.items())
         model.load_state_dict(new_di)
     return model
+
+class Encoder(nn.Module):
+    def __init__(self, z_dim, hidden_dim=[512, 512], in_dim=28**2):
+        super().__init__()
+        self.im_dim = in_dim
+        layers = []
+        indim = in_dim
+        for dim in hidden_dim[:-1]:
+            layers.append(nn.Linear(indim, dim))
+            layers.append(nn.ELU())
+            indim = dim
+        layers.append(nn.Linear(indim, hidden_dim[-1]))
+        self.fc1 = nn.Sequential(*layers)
+        self.fc21 = nn.Linear(hidden_dim[-1], z_dim)
+        self.fc22 = nn.Linear(hidden_dim[-1], z_dim)    
+
+    def forward(self, x):
+        hidden = F.softplus(self.fc1(x))
+        z_loc = self.fc21(hidden)
+        z_scale = torch.clamp(F.softplus(self.fc22(hidden)), min=1e-3)
+        return z_loc, z_scale
+
+class Decoder(nn.Module):
+    def __init__(self, z_dim, hidden_dim=[512, 512], in_dim=28**2, n_nets=1):
+        super().__init__()
+        # setup the two linear transformations used
+        layers = []
+        self.n_nets = n_nets
+        indim = z_dim
+        for dim in hidden_dim:
+            layers.append(nn.Linear(indim, dim))
+            layers.append(nn.ELU())
+            indim = dim
+        layers.append(nn.Linear(indim, in_dim))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, z):
+        return self.model(z)
+
+class Classifier(nn.Module):
+    def __init__(self, in_dim, num_classes, hidden_dim=[512, 512]):
+        super().__init__()
+        self.in_dim = in_dim
+        self.num_classes = num_classes
+        layers = []
+        indim = in_dim
+        for dim in hidden_dim:
+            layers.append(nn.Linear(indim, dim))
+            layers.append(nn.ELU())            
+            indim = dim
+        layers.append(nn.Linear(indim, num_classes))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+class CondPrior(nn.Module):
+    def __init__(self, z_dim, n_classes) -> None:
+        super().__init__()
+        self.z_dim = z_dim
+        self.n_classes = n_classes
+        self.loc = nn.Linear(n_classes, z_dim, bias=False)
+        self.scale = nn.Linear(n_classes, z_dim, bias=False)
+
+    def forward(self, y):
+        one_hot = F.one_hot(y, num_classes=self.n_classes).float()
+        loc = self.loc(one_hot)
+        scale = F.softplus(self.scale(one_hot)).clamp(min=1e-3)
+        return loc, scale
+
+def compute_kl(locs_q, scale_q, locs_p=None, scale_p=None):
+    """
+    Computes the KL(q||p)
+    """
+    if locs_p is None:
+        locs_p = torch.zeros_like(locs_q)
+    if scale_p is None:
+        scale_p = torch.ones_like(scale_q)
+
+    kl = 0.5 * (2 * scale_p.log() - 2 * scale_q.log() + \
+                (locs_q - locs_p).pow(2) / scale_p.pow(2) + \
+                scale_q.pow(2) / scale_p.pow(2) - torch.ones_like(locs_q)).sum(dim=-1)
+
+    return kl
+
+def log_likelihood(recon, xs):
+        return dist.Laplace(recon, torch.ones_like(recon)).log_prob(xs).sum(dim=-1)
+
+class CondVAE(torch.nn.Module):
+    def __init__(self, z_dim, num_classes, device,
+                 in_dim, n_nets=1):
+        super(CondVAE, self).__init__()
+        self.z_dim = z_dim
+        self.in_dim = in_dim
+        self.device = device
+        self.num_classes = num_classes
+        self.n_nets = n_nets
+        self.encoder = Encoder(self.z_dim, hidden_dim=[1024, 512, 512], in_dim=self.in_dim)
+        self.decoder = Decoder(self.z_dim, hidden_dim=[1024, 512, 512], in_dim=self.in_dim)
+        self.t_pred = Classifier(self.num_classes, 1, hidden_dim=[128, 128]) 
+        self.cond_prior = CondPrior(self.z_dim, self.num_classes)
+        self.to(device)
+
+    def elbo(self, x, y):
+        bs = x.shape[0]
+        post_params = self.encoder(x)
+        z = dist.Normal(*post_params).rsample()
+        kl = compute_kl(*post_params, *self.cond_prior(y))
+        recon = self.decoder(z)
+        log_pxz = log_likelihood(recon, x)
+        loss = - (log_pxz - kl)
+        return loss.mean()
+
+    def t_ce(self, x, pred_logits, y):
+        t = self.sample_t(x)
+        return F.cross_entropy(pred_logits / t.view(-1, 1), y)
+
+    def sample_t(self, x):
+        y = torch.linspace(0, self.num_classes-1, self.num_classes).unsqueeze(0).long().to(x.device)
+        y = y.expand(x.shape[0], -1)
+        bs = x.shape[0]
+        post_params = self.encoder(x)
+        z = dist.Normal(*post_params).rsample().unsqueeze(1).expand(-1, self.num_classes, -1)
+        p = dist.Normal(*self.cond_prior(y)).log_prob(z).sum(dim=-1)
+        t_preds = self.t_pred(p)
+        return F.softplus(t_preds).clamp(min=1e-3)
