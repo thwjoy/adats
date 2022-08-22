@@ -6,7 +6,6 @@ from torchvision import transforms
 from torch.utils.data import DataLoader 
 from calibration import TemperatureScaling, \
                         AdaptiveTemperatureScaling, \
-                        MultiAdaptiveTemperatureScaling, \
                         test
 from net import resnet50
 import numpy as np
